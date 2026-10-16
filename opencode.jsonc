@@ -1,3 +1,34 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  // Least-privilege shared baseline: secrets are never readable, shell is
+  // ask-by-default. Agent files append narrower rules after these.
+  "permissions": [
+    { "action": "read", "resource": "*.env", "effect": "deny" },
+    { "action": "read", "resource": "*.env.*", "effect": "deny" },
+    { "action": "read", "resource": "*.pem", "effect": "deny" },
+    { "action": "read", "resource": "*.key", "effect": "deny" },
+    { "action": "shell", "resource": "*", "effect": "ask" },
+  ],
+  // Local-first tooling. Semgrep runs on-machine (no code leaves the box).
+  // GitHub is toolset-limited to read-only advisory/repos to protect context
+  // and scope. Requires `uvx` / network respectively; agents degrade to
+  // skill scripts when a server is unavailable.
+  "mcp": {
+    "servers": {
+      "semgrep": {
+        "type": "local",
+        "command": ["uvx", "semgrep-mcp"],
+      },
+      "github": {
+        "type": "remote",
+        "url": "https://api.githubcopilot.com/mcp/",
+      },
+    },
+  },
+  // File-backed memory + scoring discipline, loaded every session.
+  "instructions": [
+    ".opencode/security/profile.md",
+    ".opencode/security/suppressions.md",
+    ".opencode/skills/web-recon-passive/references/scoring-rubric.md",
+  ],
 }
