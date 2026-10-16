@@ -1,0 +1,1 @@
+{"schema":"ravan-findings-v1","fields":["id","target","check","title","severity","status","cvss","kev","epss","confidence","verdict","evidence_ref","first_seen","last_seen"]}
