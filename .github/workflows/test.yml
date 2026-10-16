@@ -1,0 +1,27 @@
+name: ravan checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Skill unit tests
+        run: python .opencode/skills/web-recon-passive/scripts/test_checks.py
+      - name: Enrich selftest (offline)
+        run: python .opencode/skills/web-recon-passive/scripts/enrich.py --selftest
+      - name: Agent and command frontmatter
+        run: >
+          python -c "import yaml,glob;
+          files=glob.glob('.opencode/agents/*.md')+glob.glob('.opencode/commands/*.md');
+          [yaml.safe_load(open(f,encoding='utf-8').read().split('---')[1]) for f in files];
+          assert all('description' in yaml.safe_load(open(f,encoding='utf-8').read().split('---')[1]) for f in files);
+          print(len(files),'frontmatter OK')"
+      - name: Distribution copy in sync
+        run: cmp ravan.md .opencode/agents/ravan.md
