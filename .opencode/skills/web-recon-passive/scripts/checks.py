@@ -19,6 +19,7 @@ context-sensitive pattern below runs through LIBRARY_NOISE filtering before it
 becomes a finding. Skipping that step produces reports that are embarrassing.
 """
 
+import datetime
 import json
 import re
 import ssl
@@ -353,9 +354,19 @@ def check_dns(target, server=None):
             "renewals will fail."))
 
     # ---- DNSSEC ----
+    # Presence check upgraded: DS at the apex + DNSKEY answers are both
+    # required for a signed verdict. Full chain-of-trust validation is out of
+    # scope for stdlib DNS — the method is recorded so reports carry it as
+    # explicit scope, and dnsviz.net remains the verification step.
     dnskey = dnslib.query(domain, "DNSKEY", server=server, dnssec=True)
     ds = dnslib.values(domain, "DS", server=server)
-    facts["dnssec"] = bool(dnskey.get("answers")) or bool(ds)
+    has_dnskey = bool(dnskey.get("answers"))
+    has_ds = bool(ds)
+    facts["dnssec"] = has_dnskey and has_ds
+    facts["dnssec_detail"] = {
+        "dnskey_answers": has_dnskey, "ds_present": has_ds,
+        "method": "DS + DNSKEY presence only; chain validation not performed, verify at https://dnsviz.net",
+    }
     if not facts["dnssec"]:
         findings.append(F(
             "DNS-DNSSEC-MISSING", "Zone is not DNSSEC-signed", "low", "infra",
@@ -1549,3 +1560,286 @@ def check_error_page(client, target):
             "This is host-controlled code and cannot be patched from the customer side."))
 
     return findings, facts
+
+
+# ===========================================================================
+# 7. Passive third-party intel (crt.sh, RDAP, MTA-STS policy) + posture score
+# ===========================================================================
+# All three sources are PUBLIC RECORDS held by third parties (certificate logs,
+# registration data, mail-transport policy files). Querying them generates zero
+# traffic against the target itself. Every fetch goes through the budgeted
+# client. Parse functions are pure so the offline suite can pin them.
+CT_URL = "https://crt.sh/?q=%.{domain}&output=json"
+RDAP_URL = "https://rdap.org/domain/{domain}"
+MTA_STS_WELLKNOWN = "https://mta-sts.{domain}/.well-known/mta-sts.txt"
+CT_NAME_CAP = 100
+
+
+def parse_ct_names(payload_text, domain):
+    """Extract unique in-scope subdomains from a crt.sh JSON payload."""
+    try:
+        items = json.loads(payload_text)
+    except Exception:
+        return []
+    names = set()
+    for entry in items if isinstance(items, list) else []:
+        for key in ("name_value", "common_name"):
+            for line in str(entry.get(key, "")).splitlines():
+                name = line.strip().lower().lstrip("*.")
+                if name and (name == domain or name.endswith("." + domain)):
+                    names.add(name)
+    return sorted(names)
+
+
+def check_ct(client, target):
+    """Certificate-transparency subdomain enumeration (read-only, keyless)."""
+    findings, facts = [], {}
+    domain = target["domain"]
+    try:
+        resp = client.get(CT_URL.format(domain=domain), follow=True)
+    except Exception as exc:
+        facts["ct_error"] = f"{type(exc).__name__}: {exc}"
+        return findings, facts
+    if resp.get("status") != 200 or not resp.get("body"):
+        facts["ct_error"] = f"crt.sh HTTP {resp.get('status')}"
+        return findings, facts
+    names = parse_ct_names(resp["body"].decode("utf-8", "replace"), domain)[:CT_NAME_CAP]
+    facts["ct_subdomains"] = names
+    facts["ct_count"] = len(names)
+    if names:
+        findings.append(F(
+            "INTEL-CT-NAMES",
+            f"Certificate transparency lists {len(names)} name(s) for this domain",
+            "info", "intel",
+            [f"crt.sh ?q=%.{domain} -> {len(names)} unique in-scope names"] + names[:12],
+            "Every publicly issued certificate is logged with its SANs/CNs, so CT "
+            "enumeration reveals subdomains without touching the target. Blind spots: "
+            "wildcard certificates hide names, and non-HTTPS subdomains never appear.",
+            "CT names are leads, not live hosts — each still needs a DNS existence "
+            "check (SOA-in-authority and wildcard traps apply) before it means anything.",
+            "No action required. Use the list as the seed for DNS existence checks, "
+            "never as a finding set on its own."))
+    return findings, facts
+
+
+def parse_rdap(payload):
+    """Tolerant RDAP extraction: registrar, creation date, nameservers."""
+    if not isinstance(payload, dict):
+        return {}
+    out = {}
+    for ent in payload.get("entities", []) or []:
+        roles = ent.get("roles", []) or []
+        if "registrar" in roles:
+            vcard = ent.get("vcardArray", []) or []
+            for row in (vcard[1] if len(vcard) > 1 else []):
+                if isinstance(row, list) and row and row[0] == "fn":
+                    out["registrar"] = row[3] if len(row) > 3 else row[-1]
+    for ev in payload.get("events", []) or []:
+        if ev.get("eventAction") == "registration" and ev.get("eventDate"):
+            out["created"] = ev["eventDate"]
+    ns = [n.get("ldhName") for n in payload.get("nameservers", []) or []
+          if isinstance(n, dict) and n.get("ldhName")]
+    if ns:
+        out["nameservers"] = sorted(set(ns))
+    return out
+
+
+def domain_age_days(created_str, now=None):
+    """Age in days from an RDAP/ISO8601 timestamp, or None if unparseable."""
+    if not created_str:
+        return None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    text = created_str.strip().replace("Z", "+00:00")
+    try:
+        created = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=datetime.timezone.utc)
+    return (now - created).days
+
+
+def check_rdap(client, target):
+    """Registration context (registrar, age, nameservers). Read-only."""
+    findings, facts = [], {}
+    domain = target["domain"]
+    try:
+        resp = client.get(RDAP_URL.format(domain=domain), follow=True)
+    except Exception as exc:
+        facts["rdap_error"] = f"{type(exc).__name__}: {exc}"
+        return findings, facts
+    if resp.get("status") != 200 or not resp.get("body"):
+        facts["rdap_error"] = f"RDAP HTTP {resp.get('status')}"
+        return findings, facts
+    try:
+        info = parse_rdap(json.loads(resp["body"].decode("utf-8", "replace")))
+    except Exception:
+        facts["rdap_error"] = "RDAP body not JSON"
+        return findings, facts
+    facts["rdap"] = info
+    age = domain_age_days(info.get("created"))
+    if age is not None:
+        facts["rdap"]["age_days"] = age
+        if age < 90:
+            findings.append(F(
+                "INTEL-YOUNG-DOMAIN",
+                f"Domain registered {age} days ago — treat identity claims with care",
+                "info", "intel",
+                [f"RDAP creation date: {info.get('created')} ({age} days)",
+                 f"registrar: {info.get('registrar', '?')}"],
+                "Very young domains are disproportionately used for phishing and "
+                "short-lived campaigns. Age alone proves nothing — legitimate launches "
+                "are young too — but it changes how much trust adjacent signals deserve.",
+                "A young domain wrapped in a professional-looking site and urgent email "
+                "copy is the classic impersonation shape.",
+                "No action for an established owner. For anyone else evaluating this "
+                "domain: verify ownership through an independent channel before "
+                "trusting it."))
+    return findings, facts
+
+
+def parse_mta_sts_policy(text):
+    """Parse an MTA-STS policy file into version/mode/mx/max_age + errors."""
+    policy, errors = {"mx": []}, []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            errors.append(f"unparseable line: {line[:80]}")
+            continue
+        key, _, value = line.partition(":")
+        key, value = key.strip().lower(), value.strip()
+        if key == "version":
+            policy["version"] = value
+        elif key == "mode":
+            policy["mode"] = value.lower()
+        elif key == "mx":
+            policy["mx"].extend([h.strip().rstrip(".") for h in value.split(",") if h.strip()])
+        elif key == "max_age":
+            try:
+                policy["max_age"] = int(value)
+            except ValueError:
+                errors.append(f"non-numeric max_age: {value[:40]}")
+        else:
+            errors.append(f"unknown directive: {key[:40]}")
+    if policy.get("version") != "STSv1":
+        errors.append(f"unexpected version: {policy.get('version')}")
+    if policy.get("mode") not in ("enforce", "testing", "none"):
+        errors.append(f"unexpected mode: {policy.get('mode')}")
+    policy["errors"] = errors
+    return policy
+
+
+def _mx_hosts(mx_records):
+    hosts = set()
+    for rec in mx_records or []:
+        parts = str(rec).strip().rstrip(".").split()
+        if parts:
+            hosts.add(parts[-1].lower().lstrip("*."))
+    return hosts
+
+
+def check_mta_sts_policy(client, target, dns_facts):
+    """Fetch and validate the MTA-STS policy file (only if DNS advertises it)."""
+    findings, facts = [], {}
+    domain = target["domain"]
+    if not (dns_facts.get("mta_sts") or []) or not dns_facts.get("accepts_mail"):
+        facts["mta_sts_policy"] = {"skipped": "no _mta-sts TXT record"}
+        return findings, facts
+    try:
+        resp = client.get(MTA_STS_WELLKNOWN.format(domain=domain), follow=True)
+    except Exception as exc:
+        facts["mta_sts_policy"] = {"error": f"{type(exc).__name__}: {exc}"}
+        return findings, facts
+    if resp.get("status") != 200 or not resp.get("body"):
+        findings.append(F(
+            "DNS-MTASTS-NOPOLICY",
+            "DNS advertises MTA-STS but the policy file is unreachable", "medium", "email",
+            [f"_mta-sts.{domain} TXT present",
+             f"GET mta-sts.{domain}/.well-known/mta-sts.txt -> HTTP {resp.get('status')}"],
+            "Senders that honour MTA-STS will fail closed or fall back depending on "
+            "cached policy; a missing file means the enforcement promise in DNS is not "
+            "kept, and mail may bounce or silently downgrade.",
+            "Intermittent or total inbound mail failure for enforcing senders.",
+            "Serve a valid policy file at the well-known path, or remove the _mta-sts "
+            "TXT record so senders use opportunistic TLS instead of a broken promise."))
+        facts["mta_sts_policy"] = {"error": f"HTTP {resp.get('status')}"}
+        return findings, facts
+    policy = parse_mta_sts_policy(resp["body"].decode("utf-8", "replace"))
+    facts["mta_sts_policy"] = policy
+    facts["mta_sts_enforced"] = policy.get("mode") == "enforce" and not policy.get("errors")
+    if policy.get("mode") in ("testing", "none"):
+        findings.append(F(
+            "DNS-MTASTS-TESTING",
+            f"MTA-STS policy is in mode={policy.get('mode')} — not enforcing", "low", "email",
+            [f"mode: {policy.get('mode')}", f"max_age: {policy.get('max_age')}",
+             f"mx: {policy.get('mx')}"],
+            "Testing mode only reports; it does not stop STARTTLS-stripping "
+            "downgrades. Correct as a rollout stage, wrong as a resting state.",
+            "Mail still downgradable on-path; TLS-RPT reports (if configured) show "
+            "failures nobody acts on.",
+            "After monitoring TLS-RPT for 2+ weeks with clean reports, switch mode "
+            "to enforce. Never jump straight to enforce."))
+    mx_dns = _mx_hosts(dns_facts.get("mx"))
+    mx_pol = {h.lower().lstrip("*.") for h in policy.get("mx", [])}
+    if mx_dns and mx_pol and not any(
+            h == p or h.endswith("." + p) or p.endswith("." + h)
+            for h in mx_dns for p in mx_pol):
+        findings.append(F(
+            "DNS-MTASTS-MXMISMATCH",
+            "MTA-STS policy MX list matches none of the DNS MX hosts", "medium", "email",
+            [f"DNS MX: {sorted(mx_dns)}", f"policy mx: {sorted(mx_pol)}"],
+            "Enforcing senders compare the delivering MX against this list. A total "
+            "mismatch means legitimate mail fails policy validation.",
+            "Inbound mail rejection or deferral loops at enforcing senders.",
+            "List every MX hostname (FQDN, never wildcards) in the policy file and "
+            "keep it in sync with DNS on every mail-provider change."))
+    if policy.get("max_age") is not None and policy["max_age"] < 86400:
+        findings.append(F(
+            "DNS-MTASTS-SHORTMAXAGE",
+            f"MTA-STS max_age is {policy['max_age']}s — policy barely caches", "info", "email",
+            [f"max_age: {policy['max_age']}"],
+            "A short max_age is right during rollout but leaves only a thin "
+            "enforcement window in steady state.",
+            "Minimal direct impact; policy churn on every provider change.",
+            "Raise toward 86400+ (and higher once stable) after the testing period."))
+    return findings, facts
+
+
+_SEV_PENALTY = {"critical": 25, "high": 15, "medium": 7, "low": 3, "info": 0}
+
+
+def score_posture(findings, facts):
+    """Observatory-style 0–100 posture score with grade. Pure function.
+
+    Penalties come from finding severities (gated verdicts count half —
+    scanners will still flag them, but they are not live). Bonuses reward
+    verified controls, capped so hardening cannot mask live findings.
+    """
+    score, applied = 100, []
+    for f in findings or []:
+        sev = (f.get("severity") or "info").lower()
+        penalty = _SEV_PENALTY.get(sev, 0)
+        if f.get("verdict") == "gated":
+            penalty = (penalty + 1) // 2
+        if penalty:
+            score -= penalty
+            applied.append(f"{f.get('id')}: -{penalty} ({sev}"
+                           f"{', gated' if f.get('verdict') == 'gated' else ''})")
+    bonus = 0
+    dns = (facts or {}).get("dns", {})
+    if dns.get("dnssec"):
+        bonus += 4
+        applied.append("DNSSEC signed: +4")
+    if (facts or {}).get("mta_sts_enforced"):
+        bonus += 3
+        applied.append("MTA-STS enforced: +3")
+    hsts = ((facts or {}).get("headers", {}) or {}).get("hsts") or {}
+    if isinstance(hsts, dict) and hsts.get("preload_eligible"):
+        bonus += 3
+        applied.append("HSTS preload-eligible: +3")
+    score = max(0, min(100, score + min(10, bonus)))
+    grade = "A" if score >= 90 else "B" if score >= 80 else "C" if score >= 70 \
+        else "D" if score >= 50 else "F"
+    return {"score": score, "grade": grade, "applied": applied}

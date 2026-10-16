@@ -229,6 +229,42 @@ check("F() carries cvss/kev/epss/confidence + gated verdict",
       f2["kev"] is True and f2["epss"] == 0.97 and f2["verdict"] == "gated"
       and f2["confidence"] == "high" and f2["cvss"].startswith("CVSS:4.0"))
 
+print("\n[14] Third-party intel parsers + posture score (offline)")
+ct = checks.parse_ct_names(
+    '[{"name_value": "a.example.com\\n*.b.example.com", "common_name": "a.example.com"},'
+    ' {"name_value": "evil.com", "common_name": "x.other.net"}]', "example.com")
+check("CT keeps in-scope, strips wildcards, drops out-of-scope",
+      ct == ["a.example.com", "b.example.com"], str(ct))
+check("CT bad JSON -> []", checks.parse_ct_names("not json", "example.com") == [])
+rd = checks.parse_rdap({"entities": [{"roles": ["registrar"], "vcardArray": ["vcard", [["version", {}, "text", "4.0"], ["fn", {}, "text", "Example Registrar"]]]}],
+                        "events": [{"eventAction": "registration", "eventDate": "2020-01-15T00:00:00Z"}],
+                        "nameservers": [{"ldhName": "ns1.example.net"}]})
+check("RDAP registrar/created/nameservers parsed",
+      rd.get("registrar") == "Example Registrar" and rd.get("created") == "2020-01-15T00:00:00Z"
+      and rd.get("nameservers") == ["ns1.example.net"], str(rd))
+import datetime as _dt
+check("domain age math",
+      checks.domain_age_days("2020-01-15T00:00:00Z", _dt.datetime(2026, 10, 16, tzinfo=_dt.timezone.utc)) == 2466)
+check("domain age unparseable -> None", checks.domain_age_days("garbage") is None)
+pol = checks.parse_mta_sts_policy("version: STSv1\nmode: enforce\nmx: mail.example.com\nmax_age: 86400\n")
+check("MTA-STS policy parsed, no errors",
+      pol.get("mode") == "enforce" and pol.get("mx") == ["mail.example.com"]
+      and pol.get("max_age") == 86400 and pol["errors"] == [], str(pol))
+bad = checks.parse_mta_sts_policy("version: STSv1\nmode: enforce\nmax_age: soon\nbogus;\n")
+check("MTA-STS bad max_age + bad line reported",
+      any("max_age" in e for e in bad["errors"]) and any("unparseable" in e for e in bad["errors"]))
+sc = checks.score_posture(
+    [{"id": "A", "severity": "high"}, {"id": "B", "severity": "medium", "verdict": "gated"},
+     {"id": "C", "severity": "info"}],
+    {"dns": {"dnssec": True}, "headers": {"hsts": {"preload_eligible": True}}})
+check("posture: 100-15-4+7 bonus capped = 88/B",
+      sc["score"] == 88 and sc["grade"] == "B", str(sc))
+sc2 = checks.score_posture([{"id": "X", "severity": "critical"}], {})
+check("posture: single critical -> 75/C", sc2["score"] == 75 and sc2["grade"] == "C")
+sc3 = checks.score_posture([], {"dns": {"dnssec": True}})
+check("posture: clean + dnssec bonus capped at 100/A",
+      sc3["score"] == 100 and sc3["grade"] == "A")
+
 print("\n" + "=" * 62)
 print(f"  {PASS} passed, {FAIL} failed")
 print("=" * 62)

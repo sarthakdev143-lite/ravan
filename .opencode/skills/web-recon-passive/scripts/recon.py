@@ -102,6 +102,22 @@ def run(target_url, contact, dns_server=None, budget=400, delay=0.7,
     findings += f
     facts["dns"] = d
 
+    # ---------------- 1b. Third-party intel (zero target traffic) ----------------
+    say("[*] 1b/6 third-party intel (CT logs, RDAP, MTA-STS policy)")
+    intel = {}
+    f, ct = checks.check_ct(client, target)
+    findings += f
+    intel["ct"] = {k: v for k, v in ct.items() if k != "ct_subdomains"}
+    intel["ct_subdomains"] = ct.get("ct_subdomains", [])
+    f, rd = checks.check_rdap(client, target)
+    findings += f
+    intel["rdap"] = {k: v for k, v in rd.items()}
+    f, mp = checks.check_mta_sts_policy(client, target, d)
+    findings += f
+    intel["mta_sts"] = mp
+    facts["intel"] = intel
+    facts["mta_sts_enforced"] = bool(mp.get("mta_sts_enforced"))
+
     # ---------------- 2. TLS ----------------
     say("[*] 2/6  TLS configuration")
     f, t = checks.check_tls(target)
@@ -198,9 +214,10 @@ def run(target_url, contact, dns_server=None, budget=400, delay=0.7,
         facts["cve"] = {"skipped": "disabled by flag"}
 
     findings = sort_findings(dedupe(findings))
+    facts["posture"] = checks.score_posture(findings, facts)
     facts["meta"] = {
         "target": target["base"], "domain": target["domain"],
-        "assessed_at": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "assessed_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "requests_used": client.used, "request_budget": budget,
         "request_history": client.history,
         "tool": "passive-recon/1.0", "contact": contact,
@@ -248,6 +265,9 @@ def write_markdown(findings, facts, path, target_url):
     for sev in ("critical", "high", "medium", "low", "info"):
         A(f"| {sev.title()} | {counts.get(sev,0)} |")
     A(f"| **Total** | **{len(findings)}** |")
+    posture = facts.get("posture") or {}
+    if posture:
+        A(f"| **Posture score** | **{posture.get('score')}/100 ({posture.get('grade')})** |")
     A("")
     A("## Detected stack")
     A("")
@@ -285,6 +305,16 @@ def write_markdown(findings, facts, path, target_url):
         if f.get("exploitable") is not None:
             A(f" &nbsp;|&nbsp; **Exploitable as deployed:** "
               f"{'YES' if f['exploitable'] else 'NO — version-gated only'}")
+        scoring = " &nbsp;|&nbsp; ".join(
+            s for s in [
+                f"**CVSS:** {f['cvss']}" if f.get("cvss") else "",
+                "**KEV-listed**" if f.get("kev") else "",
+                f"**EPSS:** {f['epss']}" if f.get("epss") is not None else "",
+                f"**Confidence:** {f['confidence']}" if f.get("confidence") else "",
+                f"**Verdict:** {f['verdict']}" if f.get("verdict") else "",
+            ] if s)
+        if scoring:
+            A(f" &nbsp;|&nbsp; {scoring}")
         A("")
         A("**Evidence**")
         A("```")
