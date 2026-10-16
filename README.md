@@ -1,52 +1,95 @@
 # ravan
 
-An OpenCode agent for application-security and offensive-security work — passive assessment, secure code review, hardening guidance, and actionable reporting. V2-native (`mode: all`, `permissions` list, no legacy `temperature` / `permission` / `tools` keys).
+An OpenCode security team for application-security and offensive-security
+work — passive assessment, secure code review, hardening guidance, and
+evidence-first reporting. V2-native (ordered `permissions`, no legacy
+`temperature` / `permission` / `tools` keys).
 
-Works as a primary session agent (like `build` / `plan`) and as a `@ravan` subagent.
+Ravan runs as a primary session agent and as `@ravan`, leading a
+least-privilege team of hidden subagents.
 
 ## Layout
 
 ```text
 ravan/
-├── ravan.md                          # distribution copy — install this globally
+├── ravan.md                          # distribution copy — install globally
 ├── .opencode/
-│   ├── agents/ravan.md               # project-local agent (same content, auto-discovered)
-│   └── skills/web-recon-passive/     # passive web-review skill (DNS, TLS, headers, JS, CVE)
-├── docs/build-prompt.md              # original build prompt (dev history)
-├── opencode.jsonc                    # minimal project config
+│   ├── agents/
+│   │   ├── ravan.md                  # orchestrator (mode: all, steps: 24)
+│   │   ├── ravan-recon.md            # hidden passive-recon runner
+│   │   ├── ravan-reviewer.md         # hidden read-only code reviewer
+│   │   └── ravan-reporter.md         # hidden report renderer
+│   ├── commands/                     # /assess /threat-model /review
+│   │                                 # /harden /retest /roe
+│   ├── skills/web-recon-passive/     # passive web-review skill
+│   │   ├── scripts/                  # recon, checks, cve, enrich,
+│   │   │                           # depwatch (OSV), diff, tests
+│   │   └── references/               # legal, reporting, remediation,
+│   │                                 # hardening-matrix, review-playbook,
+│   │                                 # modern-surfaces, scoring-rubric,
+│   │                                 # report-template, detect-respond,
+│   │                                 # tooling-matrix, roe-template,
+│   │                                 # recon-checklist
+│   └── security/                     # findings ledger, suppressions,
+│                                     # target profile (file memory)
+├── AGENTS.md                         # auto-loaded project conventions
+├── opencode.jsonc                    # shared perms + MCP + instructions
+├── docs/build-prompt.md              # original build prompt (history)
 ├── LICENSE                           # MIT
 └── README.md                         # this file
 ```
 
-`ravan.md` and `.opencode/agents/ravan.md` are identical by design. Keep them in sync (same hash).
+`ravan.md` and `.opencode/agents/ravan.md` are identical by design. Keep
+them in sync (same hash).
 
 ## Capabilities
 
-- **Passive recon first:** DNS / SPF / DKIM / DMARC / CAA / DNSSEC / MTA-STS, cert-transparency, TLS chain, HTTP security headers, tech fingerprinting, public JS/CSS bundle analysis.
-- **Architecture before severity:** states what the target's architecture makes impossible (e.g. static SPA → no SQLi/RCE/SSRF) instead of flagging noise.
-- **Offensive methodology, planning-level:** intrusion lifecycle, OWASP Top 10 / ASVS / Testing Guide, MITRE ATT&CK, web classes (SQLi, XSS, CSRF, SSRF, IDOR, deserialization, auth/session, upload, traversal, logic abuse), rules-of-engagement scoping.
-- **Tooling literacy without execution:** Burp, nmap, nuclei, sqlmap, Metasploit, ffuf — plans, drafts commands for an authorized operator, interprets output. Does not launch them (denied by policy).
-- **Defensive:** CSP/HSTS/cookies/CORS/TLS, secure code review (JS/TS, Python, Go, Java, PHP, Ruby, .NET), SBOM / supply-chain / CVE gating, logging/IR basics, email-auth sequencing (monitor → quarantine → reject).
-- **Reporting:** verbatim evidence + mechanism + target-terms impact + exact fix + verification checklist, plus a false-positive appendix.
+- **Agent team, not a monolith:** orchestrator fans out to hidden
+  recon / reviewer / reporter subagents with bounded steps and
+  deny-by-default policies.
+- **Passive recon first:** DNS / SPF / DKIM / DMARC / CAA / DNSSEC /
+  MTA-STS, CT logs (`crt.sh` guidance), TLS chain, headers, tech
+  fingerprinting, JS/CSS bundle analysis with vendor-aware FP filtering.
+- **Architecture before severity:** states what the target makes
+  impossible (static SPA → no SQLi/RCE/SSRF) instead of flagging noise.
+- **Modern surfaces:** OWASP 2025 delta (supply chain, exceptional
+  conditions), API Top 10 (BOLA/BFLA/BOPLA), LLM Top 10, ATT&CK tactic +
+  technique tagging, JWT/OAuth/GraphQL/WebSocket/SSTI/XXE/race/cloud-chain
+  planning blocks.
+- **Scored findings:** every finding carries severity + CVSS + KEV + EPSS
+  + confidence + `exploitable`/`gated` verdict (`scripts/enrich.py`
+  enriches keylessly, cached, offline-safe).
+- **Memory:** append-only finding ledger, suppressions list, versioned
+  per-target profile, baseline diffing (`scripts/diff.py`), `/retest`
+  verification loops, OSV dependency watch (`scripts/depwatch.py`).
+- **Defensive depth:** per-stack hardening matrix, per-language
+  source→sink review playbook, IaC/container/CI-CD checklists,
+  detection rules + IR runbooks, email-auth sequencing
+  (monitor → quarantine → reject).
+- **Reports that fund fixes:** enforced template (scope → exec summary →
+  attack chain → findings → done-well → roadmap → verification → retest →
+  disclosure → manifest → appendices incl. rejected positives).
 
 ## Safety model
 
-- `shell: *` defaults to `ask`. Allowlisted: `git status/diff/log`, `grep`, `ls`, `cat`, `dig`, `nslookup`, `openssl s_client`, `curl -sSI`, `python* skills/*/scripts/*`, `npm audit/ls`.
-- Denied: `rm -rf`, `mkfs`, `dd`, `nmap`, `nikto`, `sqlmap`, `hydra`, `metasploit`, `msfconsole`, `gobuster`, `ffuf`, `nuclei`. The deny block is intentional — active scanning belongs in a separately authorized engagement. The agent helps plan/scope/interpret instead.
-- Authorization gate: passive review of public info is fine; probing / fuzzing / injecting / brute-forcing / exploiting requires confirmed ownership or written permission. Third parties are out of scope by default.
+- Shell `ask` by default; allowlisted recon/git/npm/python-scripts only.
+- Denied: destructive primitives, scanner/brute-forcer classes (Unix +
+  Windows LOLBins: `certutil`, `bitsadmin`, Mimikatz patterns).
+- Secrets unreadable by policy (`*.env`, `*.pem`, `*.key` denied).
+- Authorization gate every session via `question`; third parties out of
+  scope by default; tiered proof (describe → inert observable → operator
+  draft → never). Active work is planned/scoped/interpreted, never
+  launched. Outputs are machine-assisted drafts needing qualified-tester
+  attestation for compliance use.
 
 ## Install
 
 Requires OpenCode V2. See <https://opencode.ai/v2/docs/agents/>.
 
 ```powershell
-# Global — available in every project (this is what puts `ravan` in Select agent)
+# Global — available in every project (puts `ravan` in Select agent)
 New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.config\opencode\agents" | Out-Null
 Copy-Item -Path "ravan.md" -Destination "$env:USERPROFILE\.config\opencode\agents\ravan.md" -Force
-
-# Project-local — auto-discovered when you open this repo (already present)
-# .opencode/agents/ravan.md
-# .opencode/skills/web-recon-passive/
 ```
 
 ```bash
@@ -55,41 +98,33 @@ mkdir -p ~/.config/opencode/agents
 cp ravan.md ~/.config/opencode/agents/ravan.md
 ```
 
-Restart the TUI / reload the session. `ravan` appears in **Select agent** next to `build` and `plan`.
-
-Optional — make it the default for this project in `opencode.jsonc`:
-
-```jsonc
-{
-  "default_agent": "ravan",
-}
-```
+Restart the TUI / reload the session. `ravan` appears in **Select agent**
+next to `build` and `plan`. Project-local files work automatically when
+you open this repo.
 
 ## Use
 
 ```text
-# as primary agent: select `ravan` in Select agent, then
-do a passive security review of https://example.com
-review this diff for auth bypass and IDOR
-write a CSP rollout plan for this SPA
-
-# as subagent from any other agent
-@ravan review my current changes for injection and access-control flaws
+/assess example.com        # intake first — no scan without it
+/threat-model example.com  # assets, STRIDE, attack trees
+/review                    # diff review via @ravan-reviewer
+/harden CSP                # staged plan with blast-radius warnings
+/retest RVN-001            # verify one finding, update ledger
+/roe example.com           # draft Rules of Engagement
 ```
 
-The `web-recon-passive` skill auto-loads for external website reviews. Scripts run offline-capable on stdlib-only Python 3.8+:
-
-```bash
-python .opencode/skills/web-recon-passive/scripts/test_checks.py
-```
+Or plain language: `do a passive review of https://example.com`,
+`@ravan review my changes for IDOR`.
 
 ## Verify
 
 ```bash
-python .opencode/skills/web-recon-passive/scripts/test_checks.py  # 42 offline unit tests
+python .opencode/skills/web-recon-passive/scripts/test_checks.py
+python .opencode/skills/web-recon-passive/scripts/enrich.py --selftest
 ```
 
-Frontmatter checks: valid YAML, `description` present, `mode: all`, no `tools` / `permission` / `temperature` keys, `shell: * → ask` first with specific allows then denies last (last match wins).
+46 offline unit tests + enrich selftest. New `checks.py` patterns require
+new fixtures proving they do not fire on react-dom.
 
 ## License
 
