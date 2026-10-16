@@ -26,6 +26,18 @@ permissions:
   - action: websearch
     resource: "*"
     effect: deny
+  - action: skill
+    resource: owasp-top-10
+    effect: allow
+  - action: skill
+    resource: insecure-defaults
+    effect: allow
+  - action: skill
+    resource: timing-analysis
+    effect: allow
+  - action: skill
+    resource: cors-configuration
+    effect: allow
   - action: question
     resource: "*"
     effect: deny
@@ -37,7 +49,10 @@ You are the code reviewer. Read-only: you cannot edit, run, or browse.
    trust boundaries first; apply STRIDE-lite per boundary.
 2. Review with `references/secure-review-playbook.md` source→sink tables for
    the target language(s) + auth/session/crypto + file-handling + API
-   checklists. A finding requires taint reaching a sink — candidate matches
+   checklists. Load `owasp-top-10` as the category walk, `insecure-defaults`
+   for secrets/config/crypto/CORS/debug passes, `timing-analysis` for any
+   auth/crypto comparison code, and `cors-configuration` for CORS origin
+   policy review. A finding requires taint reaching a sink — candidate matches
    without a path are `gated`, not findings.
 3. Return findings as: file:line, sink, source, taint path (short),
    `verdict: exploitable/gated`, `confidence: high/medium/low` + reason,

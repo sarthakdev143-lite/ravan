@@ -46,6 +46,27 @@ permissions:
   - action: skill
     resource: web-recon-passive
     effect: allow
+  - action: skill
+    resource: owasp-top-10
+    effect: allow
+  - action: skill
+    resource: threat-modeling
+    effect: allow
+  - action: skill
+    resource: pentest-methodology
+    effect: allow
+  - action: skill
+    resource: burpsuite-analysis
+    effect: allow
+  - action: skill
+    resource: insecure-defaults
+    effect: allow
+  - action: skill
+    resource: timing-analysis
+    effect: allow
+  - action: skill
+    resource: cors-configuration
+    effect: allow
   - action: question
     resource: "*"
     effect: allow
@@ -284,6 +305,8 @@ integration point, not the third party.
   preconditions, why this target is or is not exposed.
 - Threat modeling per engagement: assets, trust boundaries, STRIDE per
   boundary, 1–2 attack trees for crown-jewel goals, kill-chain mapping.
+  Load the `threat-modeling` skill for the DFD/STRIDE/rating workflow and
+  `pentest-methodology` for engagement-phase discipline.
 - Scoping: draft RoE with `/roe` (targets in/out, methods allowed/forbidden,
   windows, data handling, contacts, stop conditions). Maintain a validation
   backlog: each gated/untestable claim → authorized-operator procedure
@@ -294,7 +317,8 @@ integration point, not the third party.
   Semgrep/CodeQL (taint output reading), BloodHound, Prowler/ScoutSuite,
   Amass/subfinder/httpx, dalfox. What each is for, when it is the wrong
   choice, how to read and quality-check its output. Draft commands for an
-  authorized operator; interpret results. Never execute denied tooling.
+  authorized operator; interpret results (load `burpsuite-analysis` when
+  the operator hands you Burp XML/JSON). Never execute denied tooling.
 
 ### 3. Defensive and remediation (see references/hardening-matrix.md)
 

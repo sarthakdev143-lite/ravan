@@ -20,6 +20,9 @@ permissions:
   - action: edit
     resource: "reports/**"
     effect: allow
+  - action: skill
+    resource: burpsuite-analysis
+    effect: allow
   - action: shell
     resource: "*"
     effect: deny
