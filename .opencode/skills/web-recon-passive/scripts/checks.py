@@ -111,7 +111,7 @@ SECRET_PATTERNS = {
 # changes both severity and remediation. Mislabelling these as critical secrets
 # is one of the most common ways automated reports lose credibility.
 PUBLIC_BY_DESIGN = ("Web3Forms access_key", "Formcarry endpoint", "Formspree endpoint",
-                    "Algolia search-only key")
+                    "Algolia search-only key", "Stripe publishable key")
 
 SECURITY_HEADERS = [
     ("Strict-Transport-Security", "medium",
@@ -157,12 +157,21 @@ SERVER_RUNTIME_MARKERS = ["createRequestHandler", "@react-router/node",
 
 
 def F(fid, title, severity, category, evidence, analysis, impact, remediation,
-      exploitable=None):
-    """Construct a finding dict."""
+      exploitable=None, cvss=None, kev=False, epss=None, confidence="medium",
+      verdict=None):
+    """Construct a finding dict.
+
+    Scoring fields (see references/scoring-rubric.md): cvss vector/score,
+    kev membership, epss percentile, confidence high/medium/low, and the
+    exploitable/gated verdict. Defaults keep old call sites working.
+    """
     return {"id": fid, "title": title, "severity": severity, "category": category,
             "evidence": evidence if isinstance(evidence, list) else [str(evidence)],
             "analysis": analysis, "impact": impact, "remediation": remediation,
-            "exploitable": exploitable}
+            "exploitable": exploitable, "cvss": cvss, "kev": kev, "epss": epss,
+            "confidence": confidence,
+            "verdict": verdict if verdict is not None else (
+                "exploitable" if exploitable else ("gated" if exploitable is False else None))}
 
 
 def _noise(segment: str) -> bool:

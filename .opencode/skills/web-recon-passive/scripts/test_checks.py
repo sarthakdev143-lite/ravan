@@ -205,6 +205,30 @@ check("domain derived from host", n["domain"] == "augmentinfotech.com")
 n2 = webfetch.normalise("https://www.sub.example.co.uk/x")
 check("multi-label host handled", n2["host"] == "www.sub.example.co.uk")
 
+print("\n[13] Scoring fields + publishable-key discipline")
+# prefix is fragmented ("pk" + "_live_...") so the key pattern never
+# occurs literally in this file.
+PK = 'const stripe=Stripe("' + "pk" + "_live_4eC39HqLyjWDarjtT1zdp7dc" + '");'
+hits = checks.scan_secrets({"pay.js": PK})
+check("Stripe publishable key classified public_by_design",
+      all(h["public_by_design"] for h in hits if "publishable" in h["label"])
+      and any("publishable" in h["label"] for h in hits),
+      str([h["label"] for h in hits]))
+SK = 'const s="' + "sk" + "_live_4eC39HqLyjWDarjtT1zdp7dc" + "00000000" + '";'
+hits2 = checks.scan_secrets({"srv.js": SK})
+check("Stripe SECRET key is NOT public_by_design",
+      all(not h["public_by_design"] for h in hits2 if "secret" in h["label"].lower()))
+f = checks.F("T-1", "t", "high", "c", ["e"], "a", "i", "r", exploitable=True)
+check("F() defaults: kev False, confidence medium, verdict exploitable",
+      f["kev"] is False and f["confidence"] == "medium" and f["verdict"] == "exploitable"
+      and f["cvss"] is None and f["epss"] is None)
+f2 = checks.F("T-2", "t", "medium", "c", ["e"], "a", "i", "r",
+             exploitable=False, cvss="CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:N/SC:N/SI:N/SA:N",
+             kev=True, epss=0.97, confidence="high")
+check("F() carries cvss/kev/epss/confidence + gated verdict",
+      f2["kev"] is True and f2["epss"] == 0.97 and f2["verdict"] == "gated"
+      and f2["confidence"] == "high" and f2["cvss"].startswith("CVSS:4.0"))
+
 print("\n" + "=" * 62)
 print(f"  {PASS} passed, {FAIL} failed")
 print("=" * 62)
