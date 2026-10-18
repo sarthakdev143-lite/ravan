@@ -918,34 +918,62 @@ def check_surface(client, target, html_text, asset_paths):
 
     # ---- allowed methods ----
     opts = client.request(base + "/", method="OPTIONS")
-    allow = webfetch.Client.header(opts.get("headers"), "Allow")
+    allow = webfetch.Client.header(opts.get("headers"), "Allow") or ""
     facts["allow"] = allow
+    allow_methods = {m.strip().upper() for m in allow.split(",") if m.strip()}
     probe = {}
     for m in ("PUT", "DELETE", "PATCH", "TRACE"):
         r = client.request(base + "/", method=m)
-        probe[m] = r.get("status")
-    facts["method_probe"] = probe
+        probe[m] = {"status": r.get("status")}
+    facts["method_probe"] = {m: v["status"] for m, v in probe.items()}
     # 405 (Method Not Allowed) and 501 (Not Implemented) both mean the method is
     # REFUSED — that is the desired outcome. Only a 2xx means it is honoured.
     # Flagging 405 as "TRACE enabled" is a classic scanner false positive.
-    if probe.get("TRACE") == 200:
+    if probe.get("TRACE", {}).get("status") == 200:
         findings.append(F(
             "HTTP-TRACE", "TRACE method is enabled", "medium", "http",
-            [f"TRACE -> {probe.get('TRACE')}"],
+            [f"TRACE -> {probe['TRACE']['status']}"],
             "TRACE echoes the request back including headers, enabling cross-site tracing.",
             "Credential and cookie theft via XST when combined with another injection flaw.",
             "Disable TRACE. Apache/LiteSpeed: TraceEnable off"))
-    facts["trace_refused"] = probe.get("TRACE") in (405, 501, 403, 400)
-    risky = [m for m in ("PUT", "DELETE", "PATCH") if probe.get(m) in (200, 204)]
-    if risky:
+    facts["trace_refused"] = probe.get("TRACE", {}).get("status") in (405, 501, 403, 400)
+    # A 2xx on `/` alone does NOT prove write capability. CDN/edge SPA
+    # fallbacks answer every method with the app shell and 200; shells rotate
+    # nonces per request so no body comparison can distinguish fallback from
+    # support; bot-guarded edges even vary by client. The only passive proof
+    # of support is the edge saying so (Allow header). Everything else is an
+    # unconfirmed edge artifact — info, never higher.
+    confirmed = [m for m in ("PUT", "DELETE", "PATCH")
+                 if probe[m]["status"] in (200, 204) and m in allow_methods]
+    unconfirmed = [m for m in ("PUT", "DELETE", "PATCH")
+                   if probe[m]["status"] in (200, 204) and m not in allow_methods]
+    if confirmed:
         findings.append(F(
-            "HTTP-WRITE-METHODS", f"Write-capable HTTP methods accepted: {risky}", "high",
-            "http", [f"{m} -> {probe[m]}" for m in risky],
+            "HTTP-WRITE-METHODS", f"Write-capable HTTP methods accepted: {confirmed}", "high",
+            "http", [f"{m} -> {probe[m]['status']} (Allow-listed)" for m in confirmed],
             "The server accepts methods that can modify or delete resources.",
             "Potential for unauthorised content modification or deletion.",
             "Restrict to GET/HEAD/POST unless the application genuinely requires more, and "
             "authenticate any that do."))
-    facts["methods_ok"] = not risky and probe.get("TRACE") not in (200, 405)
+    if unconfirmed:
+        findings.append(F(
+            "HTTP-METHODS-UNCONFIRMED",
+            f"Edge returns 2xx for {unconfirmed} with no Allow header — support unproven",
+            "info", "http",
+            [f"{m} -> {probe[m]['status']}" for m in unconfirmed]
+            + [f"Allow header: {allow or 'absent'}"],
+            "CDN/edge SPA fallbacks answer every method with the application shell "
+            "and 200; shells rotate per-request tokens so no body comparison can "
+            "distinguish fallback from support; bot-guarded edges even vary by "
+            "client. Without an Allow header, support is unproven — this is edge "
+            "routing until shown otherwise.",
+            "None as observed. The risk only materialises if an authenticated "
+            "non-root endpoint actually honours these methods.",
+            "Confirm with an authorized request against a real API route, or check "
+            "the CDN/edge method policy. Do not escalate without that confirmation.",
+            confidence="low"))
+    facts["methods_ok"] = not confirmed and not unconfirmed \
+        and probe.get("TRACE", {}).get("status") != 200
 
     # ---- standards files ----
     facts["standards_files"] = {}
@@ -1031,6 +1059,24 @@ def check_surface(client, target, html_text, asset_paths):
                 break
 
     # ---- inline sourceMappingURL comments ----
+    # A data: URI map embeds the ORIGINAL SOURCE inside the served page/asset —
+    # worse than a published .map file because no second request is needed.
+    inline_maps = sorted(set(
+        m[:120] for m in re.findall(r'sourceMappingURL\s*=\s*(data:[^"\'\s}]{0,120})', html_text or "")))
+    facts["inline_sourcemaps"] = len(inline_maps)
+    if inline_maps:
+        findings.append(F(
+            "HTTP-INLINE-SOURCEMAP", "Inline source map embedded via data: URI", "high", "app",
+            [f"sourceMappingURL=data: present ({len(inline_maps)} occurrence(s))",
+             f"prefix: {inline_maps[0]}"],
+            "The unminified original source — comments, variable names, dead code "
+            "paths — ships inside the production response. No separate .map fetch "
+            "is needed; view-source is enough.",
+            "Same exposure as a published .map file with zero additional effort "
+            "for the reader: easier reverse engineering and possible embedded "
+            "secrets.",
+            "Strip inline maps from production builds (devtool: false / "
+            "build.sourcemap: false) or upload maps to the error tracker only."))
     return findings, facts
 
 
@@ -1374,23 +1420,62 @@ def check_bundle(client, target, html_text):
                                   combined)))
     facts["emails"] = [e for e in emails
                        if not e.endswith((".png", ".jpg", ".svg", ".webp", ".js", ".css"))]
-    facts["sri"] = "integrity=" in html_text
-    third_party = [o for o in facts["external_origins"] if target["host"] not in o]
-    if third_party and not facts["sri"]:
-        findings.append(F(
-            "JS-NO-SRI", "Third-party resources loaded without Subresource Integrity",
-            "low", "app",
-            ["integrity= attributes in HTML: 0",
-             f"third-party origins referenced: {third_party[:10]}"],
-            "Resources fetched from third-party origins carry no integrity hash.",
-            "A compromised or DNS-hijacked CDN could serve modified script or CSS that "
-            "executes with the full privileges of your origin. Google Fonts and tag "
-            "managers are high-value supply-chain targets and have been abused in real "
-            "attacks.",
-            "Prefer self-hosting static assets — self-hosting fonts removes the request, "
-            "the SRI problem, and a GDPR concern (Google Fonts leak visitor IPs to "
-            "Google). Where third-party scripts are unavoidable, add integrity= and "
-            "crossorigin=anonymous."))
+    # ---- SRI per-resource coverage (not a boolean) ----
+    _apply_sri_and_debug(findings, facts, html_text, target, blobs)
+
+
+def sri_coverage(html_text, host):
+    """Per-resource SRI coverage. Pure — pinned by offline tests."""
+    scripts = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']([^>]*)>', html_text or "", re.I)
+    styles = re.findall(r'<link[^>]+href=["\']([^"\']+\.css[^"\']*)["\']([^>]*)>', html_text or "", re.I)
+
+    def _covered(tag):
+        url, rest = tag
+        third = not (url.startswith("/") or url.startswith("#") or host in url
+                     or url.startswith("data:"))
+        return third, ("integrity=" in rest.lower())
+
+    s_cov = [_covered(t) for t in scripts]
+    c_cov = [_covered(t) for t in styles]
+    return {
+        "scripts_total": len(scripts),
+        "scripts_third_party": sum(1 for third, _ in s_cov if third),
+        "scripts_with_integrity": sum(1 for _, ok in s_cov if ok),
+        "styles_total": len(styles),
+        "styles_with_integrity": sum(1 for _, ok in c_cov if ok),
+        "unprotected": [u for (u, _), (third, ok) in zip(scripts, s_cov)
+                        if third and not ok][:10],
+    }
+
+
+def _sri_finding(cov):
+    """Bundle-level SRI finding from a coverage dict. Keeps check_bundle lean."""
+    unprotected = cov["unprotected"]
+    if not unprotected:
+        return None
+    return F(
+        "JS-NO-SRI", "Third-party scripts loaded without Subresource Integrity",
+        "low", "app",
+        [f"scripts: {cov['scripts_total']} total, "
+         f"{cov['scripts_third_party']} third-party, "
+         f"{cov['scripts_with_integrity']} with integrity=",
+         f"styles: {cov['styles_total']} total, "
+         f"{cov['styles_with_integrity']} with integrity="]
+        + [f"unprotected: {u}" for u in unprotected],
+        "Resources fetched from third-party origins carry no integrity hash.",
+        "A compromised or DNS-hijacked CDN could serve modified script that "
+        "executes with the full privileges of your origin.",
+        "Prefer self-hosting static assets. Where third-party scripts are "
+        "unavoidable, add integrity= and crossorigin=anonymous.")
+
+
+def _apply_sri_and_debug(findings, facts, html_text, target, blobs):
+    """SRI finding plus debug-leftover scan — both consume the fetched blobs."""
+    cov = sri_coverage(html_text, target["host"])
+    facts["sri"] = {k: v for k, v in cov.items() if k != "unprotected"}
+    finding = _sri_finding(cov)
+    if finding:
+        findings.append(finding)
 
     # ---- debug leftovers, app chunks only ----
     logs = []
@@ -1674,8 +1759,17 @@ def check_rdap(client, target):
     try:
         info = parse_rdap(json.loads(resp["body"].decode("utf-8", "replace")))
     except Exception:
-        facts["rdap_error"] = "RDAP body not JSON"
-        return findings, facts
+        info = {}
+    if not info.get("created"):
+        # RDAP empty or thin for this TLD — one port-43 fallback, same data.
+        try:
+            info = parse_whois(whois_lookup(domain)) or info
+            facts["rdap_source"] = "whois-fallback"
+        except Exception as exc:
+            facts["rdap_error"] = f"RDAP body not JSON; WHOIS fallback: {type(exc).__name__}"
+            return findings, facts
+    else:
+        facts["rdap_source"] = "rdap"
     facts["rdap"] = info
     age = domain_age_days(info.get("created"))
     if age is not None:
@@ -1843,3 +1937,156 @@ def score_posture(findings, facts):
     grade = "A" if score >= 90 else "B" if score >= 80 else "C" if score >= 70 \
         else "D" if score >= 50 else "F"
     return {"score": score, "grade": grade, "applied": applied}
+
+
+PRELOAD_API = "https://hstspreload.org/api/v2/status?domain={domain}"
+
+
+def check_preload(client, target, headers_facts):
+    """HSTS preload-list membership (hstspreload.org public API)."""
+    findings, facts = [], {}
+    try:
+        resp = client.get(PRELOAD_API.format(domain=target["domain"]), follow=True)
+    except Exception as exc:
+        facts["preload"] = {"error": f"{type(exc).__name__}: {exc}"}
+        return findings, facts
+    try:
+        facts["preload"] = json.loads(resp.get("body", b"").decode("utf-8", "replace"))
+    except Exception:
+        facts["preload"] = {"error": f"HTTP {resp.get('status')}"}
+        return findings, facts
+    status = (facts["preload"] or {}).get("status", "unknown")
+    hsts = (headers_facts or {}).get("hsts") or {}
+    eligible = isinstance(hsts, dict) and hsts.get("preload_eligible")
+    if status == "preloaded":
+        findings.append(F(
+            "INTEL-PRELOADED", "Domain is on the HSTS preload list", "info", "transport",
+            [f"hstspreload.org status: preloaded"],
+            "First-visit SSL-strip is closed even before any response is seen.",
+            "None — this is a confirmed control. Keep max-age high; removal takes "
+            "months and is effectively irreversible.",
+            "No action. Re-verify after any header or registrar change."))
+    elif eligible and status in ("unknown", "rejected", "pending"):
+        findings.append(F(
+            "HDR-PRELOAD-MISSING", "HSTS is preload-eligible but not submitted", "low",
+            "transport",
+            [f"header max-age/includeSubDomains qualify for preload",
+             f"hstspreload.org status: {status}"],
+            "Eligible headers without list membership leave first-visit users "
+            "unprotected on fresh profiles.",
+            "SSL-strip window on first contact only.",
+            "Submit at hstspreload.org after confirming every subdomain serves "
+            "valid HTTPS. Understand removal takes months."))
+    return findings, facts
+
+
+WEAK_CIPHER_GROUPS = [
+    ("NULL", ("NULL",), "high", "No encryption at all — traffic is cleartext."),
+    ("anon", ("aNULL", "ADH", "AECDH"), "high",
+     "Anonymous key exchange — no server authentication, trivially intercepted."),
+    ("export", ("EXPORT", "EXP"), "high",
+     "Deliberately weakened export-grade ciphers (FREAK/LOGJAM class)."),
+    ("DES", ("DES-CBC",), "medium", "Single DES is brute-forceable."),
+    ("RC4", ("RC4",), "medium", "RC4 biases leak plaintext over many requests."),
+    ("3DES", ("DES-CBC3", "3DES"), "low",
+     "64-bit blocks — SWEET32 birthday attacks on long-lived connections."),
+]
+
+
+def probe_ciphers(host, port=443, timeout=8):
+    """Try handshakes restricted to historically weak cipher groups.
+
+    Returns {group: accepted_bool}. Pure handshake attempts — no exploit
+    traffic. Any failure (refused, timeout) counts as not-accepted.
+    """
+    results = {}
+    for group, names, _, _ in WEAK_CIPHER_GROUPS:
+        accepted = False
+        for cipher in names:
+            try:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                ctx.set_ciphers(cipher)
+                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+                raw = socket.create_connection((host, port), timeout=timeout)
+                try:
+                    with ctx.wrap_socket(raw, server_hostname=host) as tls:
+                        accepted = True
+                finally:
+                    try:
+                        raw.close()
+                    except Exception:
+                        pass
+                if accepted:
+                    break
+            except Exception:
+                continue
+        results[group] = accepted
+    return results
+
+
+def check_ciphers(target, probe_fn=probe_ciphers):
+    """Report accepted weak cipher groups (finding) or clean refusal (fact)."""
+    findings, facts = [], {}
+    try:
+        results = probe_fn(target["host"], target.get("port", 443))
+    except Exception as exc:
+        facts["ciphers"] = {"error": f"{type(exc).__name__}: {exc}"}
+        return findings, facts
+    facts["ciphers"] = {"weak_accepted": [g for g, ok in results.items() if ok],
+                        "weak_refused": [g for g, ok in results.items() if not ok]}
+    for group, _, sev, note in WEAK_CIPHER_GROUPS:
+        if results.get(group):
+            findings.append(F(
+                f"TLS-WEAK-{group.upper()}",
+                f"Server negotiates {group} cipher suites", sev, "crypto",
+                [f"handshake restricted to {group} succeeded against "
+                 f"{target['host']}:{target.get('port', 443)}"],
+                note,
+                "Decryption or impersonation by capable on-path attackers; "
+                "compliance failures.",
+                "Restrict to AEAD suites (TLS 1.2 ECDHE+AESGCM/ChaCha20, prefer "
+                "TLS 1.3), disable the group server-side, and re-test."))
+    return findings, facts
+
+
+def parse_whois(text):
+    """Best-effort registrar/creation extraction from port-43 WHOIS text."""
+    out = {}
+    for line in (text or "").splitlines():
+        low = line.lower()
+        if not out.get("registrar") and low.startswith(("registrar:", "registrar name:")):
+            out["registrar"] = line.split(":", 1)[1].strip()
+        if not out.get("created") and low.startswith(
+                ("creation date:", "created:", "registered on:", "registration time:")):
+            out["created"] = line.split(":", 1)[1].strip()
+    return out
+
+
+def whois_lookup(domain, timeout=10):
+    """Minimal port-43 WHOIS with one IANA referral hop. Returns raw text."""
+    def _ask(server, query):
+        raw = socket.create_connection((server, 43), timeout=timeout)
+        try:
+            raw.sendall((query + "\r\n").encode())
+            chunks = []
+            while True:
+                data = raw.recv(4096)
+                if not data:
+                    break
+                chunks.append(data)
+                if sum(map(len, chunks)) > 65536:
+                    break
+            return b"".join(chunks).decode("utf-8", "replace")
+        finally:
+            raw.close()
+    first = _ask("whois.iana.org", domain)
+    referral = None
+    for line in first.splitlines():
+        if line.lower().startswith("refer:"):
+            referral = line.split(":", 1)[1].strip()
+            break
+    if referral:
+        return _ask(referral, domain)
+    return first

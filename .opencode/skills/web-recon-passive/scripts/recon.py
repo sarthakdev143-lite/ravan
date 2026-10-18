@@ -103,7 +103,7 @@ def run(target_url, contact, dns_server=None, budget=400, delay=0.7,
     facts["dns"] = d
 
     # ---------------- 1b. Third-party intel (zero target traffic) ----------------
-    say("[*] 1b/6 third-party intel (CT logs, RDAP, MTA-STS policy)")
+    say("[*] 1b/6 third-party intel (CT logs, RDAP, MTA-STS policy, preload)")
     intel = {}
     f, ct = checks.check_ct(client, target)
     findings += f
@@ -117,6 +117,12 @@ def run(target_url, contact, dns_server=None, budget=400, delay=0.7,
     intel["mta_sts"] = mp
     facts["intel"] = intel
     facts["mta_sts_enforced"] = bool(mp.get("mta_sts_enforced"))
+
+    # ---------------- 1c. Transport extras (handshakes only, no exploit) ----------------
+    say("[*] 1c/6 weak-cipher probing (7 restricted handshakes)")
+    f, ci = checks.check_ciphers(target)
+    findings += f
+    facts["ciphers"] = ci
 
     # ---------------- 2. TLS ----------------
     say("[*] 2/6  TLS configuration")
@@ -183,6 +189,11 @@ def run(target_url, contact, dns_server=None, budget=400, delay=0.7,
     f, h = checks.check_headers(client, target, extra_paths=tuple(paths))
     findings += f
     facts["headers"] = h
+
+    # Preload-list status needs the header verdicts above — runs here, not in 1c.
+    f, pl = checks.check_preload(client, target, h)
+    findings += f
+    facts["preload"] = pl
 
     # ---------------- 4. surface ----------------
     say("[*] 4/6  routing, methods, standards files, source maps")

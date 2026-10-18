@@ -265,6 +265,88 @@ sc3 = checks.score_posture([], {"dns": {"dnssec": True}})
 check("posture: clean + dnssec bonus capped at 100/A",
       sc3["score"] == 100 and sc3["grade"] == "A")
 
+print("\n[15] Method probing — SPA-fallback discipline")
+class _FakeClient:
+    def __init__(self, shell, allow="", probes=None):
+        self.shell = shell
+        self.allow = allow
+        self.probes = probes or {}
+    def request(self, url, method="GET", headers=None, follow=False, body=None):
+        if method == "GET":
+            return {"status": 200, "headers": {}, "body": self.shell}
+        if method == "OPTIONS":
+            return {"status": 200, "headers": {"Allow": self.allow} if self.allow else {}, "body": b""}
+        if method in ("PUT", "DELETE", "PATCH", "TRACE"):
+            st, same = self.probes.get(method, (405, True))
+            return {"status": st, "headers": {}, "body": self.shell if same else self.shell + b"CHANGED"}
+        return {"status": 404, "headers": {}, "body": b""}
+    def get(self, url, **kw):
+        return self.request(url, "GET", **kw)
+
+SHELL = b"<html>app shell</html>"
+tgt = {"base": "https://x.example", "domain": "x.example", "host": "x.example"}
+f, _ = checks.check_surface(_FakeClient(SHELL, probes={"PUT": (200, True), "DELETE": (200, True), "PATCH": (200, True), "TRACE": (405, True)}), tgt, SHELL.decode(), [])
+ids = [x["id"] for x in f]
+check("SPA fallback 2xx -> info UNCONFIRMED, never HIGH",
+      "HTTP-WRITE-METHODS" not in ids and "HTTP-METHODS-UNCONFIRMED" in ids, str(ids))
+f2, _ = checks.check_surface(_FakeClient(SHELL, allow="GET, HEAD, PUT", probes={"PUT": (200, True), "DELETE": (405, True), "PATCH": (405, True), "TRACE": (405, True)}), tgt, SHELL.decode(), [])
+ids2 = [x["id"] for x in f2]
+check("Allow-listed PUT -> HIGH with evidence",
+      "HTTP-WRITE-METHODS" in ids2 and "HTTP-METHODS-UNCONFIRMED" not in ids2, str(ids2))
+f3, facts3 = checks.check_surface(_FakeClient(SHELL, probes={"PUT": (405, True), "DELETE": (405, True), "PATCH": (405, True), "TRACE": (405, True)}), tgt, SHELL.decode(), [])
+check("all refused -> methods_ok True, no method findings",
+      facts3.get("methods_ok") is True and not [x for x in f3 if x["id"].startswith("HTTP-WRITE") or x["id"].startswith("HTTP-METHODS")])
+MB = "<html> multibyte shell — DeepSeek café naïve façade … </html>".encode("utf-8")
+assert len(MB) != len(MB.decode("utf-8")), "fixture must have multibyte chars"
+f4, _ = checks.check_surface(_FakeClient(MB, probes={"PUT": (200, True), "DELETE": (200, True), "PATCH": (200, True), "TRACE": (405, True)}), tgt, MB.decode("utf-8"), [])
+ids4 = [x["id"] for x in f4]
+check("multibyte shell: byte-identical 2xx still UNCONFIRMED (bytes-vs-chars trap)",
+      "HTTP-WRITE-METHODS" not in ids4 and "HTTP-METHODS-UNCONFIRMED" in ids4, str(ids4))
+
+print("\n[16] Round-2 intel: sourcemaps, SRI, preload, ciphers, WHOIS")
+class _SurfClient:
+    def __init__(self, statuses=None):
+        self.statuses = statuses or {}
+    def request(self, url, method="GET", headers=None, follow=False, body=None):
+        for suffix, (st, bd) in self.statuses.items():
+            if url.endswith(suffix) and (method == "GET" or suffix != "/"):
+                return {"status": st, "headers": {}, "body": bd}
+        if method == "OPTIONS":
+            return {"status": 200, "headers": {}, "body": b""}
+        return {"status": 405 if method in ("PUT", "DELETE", "PATCH", "TRACE") else 404,
+                "headers": {}, "body": b""}
+    def get(self, url, **kw):
+        return self.request(url, "GET", **kw)
+
+HTML_MAP = '<html><head></head><body><script src="/app.js"></script><!--# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozfQ== --></body></html>'
+f, facts = checks.check_surface(_SurfClient(), {"base": "https://m.example", "domain": "m.example", "host": "m.example"}, HTML_MAP, [])
+check("inline data: sourcemap -> HIGH HTTP-INLINE-SOURCEMAP",
+      any(x["id"] == "HTTP-INLINE-SOURCEMAP" and x["severity"] == "high" for x in f))
+HTML_SRI = ('<html><head><link rel="stylesheet" href="https://cdn.third.com/a.css">'
+            '<script src="https://cdn.third.com/b.js"></script>'
+            '<script src="/local.js" integrity="sha384-x"></script></head></html>')
+sri = checks.sri_coverage(HTML_SRI, "m.example")
+check("SRI counted per-resource (1 third-party script uncovered, local covered)",
+      sri.get("scripts_third_party") == 1 and sri.get("scripts_with_integrity") == 1
+      and sri.get("styles_total") == 1 and sri.get("styles_with_integrity") == 0
+      and sri.get("unprotected") == ["https://cdn.third.com/b.js"], str(sri))
+class _PreClient:
+    def get(self, url, **kw):
+        return {"status": 200, "headers": {},
+                "body": b'{"status": "unknown", "domain": "m.example"}'}
+f, pl = checks.check_preload(_PreClient(), {"domain": "m.example"},
+                             {"hsts": {"preload_eligible": True}})
+check("eligible + unknown preload -> low HDR-PRELOAD-MISSING",
+      any(x["id"] == "HDR-PRELOAD-MISSING" for x in f))
+f, ci = checks.check_ciphers({"host": "x.invalid", "port": 443},
+                             probe_fn=lambda h, p=443: {"NULL": False, "anon": False, "export": False, "DES": False, "RC4": True, "3DES": False})
+check("RC4 accepted -> medium TLS-WEAK-RC4, rest refused in facts",
+      any(x["id"] == "TLS-WEAK-RC4" and x["severity"] == "medium" for x in f)
+      and ci["ciphers"]["weak_refused"] != [], str(ci))
+w = checks.parse_whois("Domain Name: EXAMPLE.COM\nRegistrar: Example Registrar, Inc.\nCreation Date: 1995-08-14T04:00:00Z\n")
+check("WHOIS parse registrar + creation",
+      w.get("registrar") == "Example Registrar, Inc." and w.get("created") == "1995-08-14T04:00:00Z", str(w))
+
 print("\n" + "=" * 62)
 print(f"  {PASS} passed, {FAIL} failed")
 print("=" * 62)
