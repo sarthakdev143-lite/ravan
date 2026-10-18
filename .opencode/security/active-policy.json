@@ -1,0 +1,36 @@
+{
+  "schema": "ravan-active-policy-v2",
+  "target": "example.com",
+  "authorized": false,
+  "owner_asserted": false,
+  "expires": null,
+  "tiers": {
+    "tier0_passive": {
+      "enabled": true,
+      "description": "Passive recon — DNS, TLS, headers, public JS analysis. No active probing."
+    },
+    "tier1_safe_active": {
+      "enabled": false,
+      "description": "Safe active checks — CORS validation, JWT alg probe, DMARC spoof test, Nuclei cves/exposure/misconfig tags, Semgrep."
+    },
+    "tier2_intrusive": {
+      "enabled": false,
+      "description": "Intrusive scanning — Nuclei intrusive/fuzzing tags, injection probing, brute-force. Requires per-run confirmation."
+    },
+    "tier3_destructive": {
+      "enabled": false,
+      "description": "Destructive — DoS, lateral movement, credential replay. Never authorized for automated agents."
+    }
+  },
+  "scope": {
+    "included": ["example.com", "*.example.com"],
+    "excluded": ["staging.example.com", "api.third-party.com"]
+  },
+  "max_requests": 1000,
+  "stop_conditions": [
+    "target returns 5xx errors indicating scan is unwanted",
+    "rate-limiting or WAF blocks",
+    "owner requests stop"
+  ],
+  "emergency_contact": "security@example.com"
+}
