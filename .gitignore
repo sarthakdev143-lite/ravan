@@ -11,6 +11,12 @@ report/
 *-report/
 *.json.bak
 
+# Ravan runtime artifacts (derived / per-engagement — regenerated, never committed)
+.opencode/security/ravan.db
+.opencode/security/leads.jsonl
+.opencode/security/scan-results/
+.opencode/security/*-calibration.json
+
 # OS / editors
 .DS_Store
 Thumbs.db

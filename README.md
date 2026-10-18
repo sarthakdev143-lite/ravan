@@ -13,17 +13,30 @@ least-privilege team of hidden subagents.
 ```text
 ravan/
 ├── ravan.md                          # distribution copy — install globally
+├── engine/                           # Python engine scripts
+│   ├── policy_check.py               # active-policy.json enforcement (code, not prose)
+│   ├── ledger_append.py              # validated ledger writer (subagents use this)
+│   ├── scout_run.py                  # active scanner wrapper (scope + policy enforced)
+│   ├── safe_write.py                 # path containment helper (reports/ only)
+│   ├── doctor.py                     # tool audit + preflight + fallback matrix
+│   ├── gate.py                       # completion gate (done = DB fact, not belief)
+│   └── leads.py                      # leads ledger (nothing abandoned)
+├── db/
+│   └── ravan.py                      # SQLite findings DB (cross-session, queryable)
 ├── .opencode/
 │   ├── agents/
-│   │   ├── ravan.md                  # orchestrator (mode: all, steps: 24)
+│   │   ├── ravan.md                  # orchestrator (mode: all, steps: 48)
 │   │   ├── ravan-recon.md            # hidden passive-recon runner
 │   │   ├── ravan-reviewer.md         # hidden read-only code reviewer
-│   │   └── ravan-reporter.md         # hidden report renderer
-│   ├── commands/                     # /assess /threat-model /review
-│   │                                 # /harden /retest /roe
+│   │   ├── ravan-reporter.md         # hidden report renderer
+│   │   ├── ravan-verifier.md         # hidden verification loop-closer
+│   │   ├── ravan-scout.md            # hidden active-scout (via scout_run.py)
+│   │   └── ravan-handoff.md          # hidden stakeholder artifact generator
+│   ├── commands/                     # /assess /no-escape /threat-model
+│   │                                 # /review /harden /retest /roe
 │   ├── skills/web-recon-passive/     # passive web-review skill
-│   │   ├── scripts/                  # recon, checks, cve, enrich,
-│   │   │                           # depwatch (OSV), diff, tests
+│   │   ├── scripts/                  # recon, checks, cve, enrich, calibrate,
+│   │   │                             # trend, depwatch (OSV), diff, tests
 │   │   └── references/               # legal, reporting, remediation,
 │   │                                 # hardening-matrix, review-playbook,
 │   │                                 # modern-surfaces, scoring-rubric,
@@ -31,7 +44,10 @@ ravan/
 │   │                                 # tooling-matrix, roe-template,
 │   │                                 # recon-checklist
 │   └── security/                     # findings ledger, suppressions,
-│                                     # target profile (file memory)
+│       ├── findings.jsonl             # append-only ledger
+│       ├── leads.jsonl               # discovered-but-unexplored pathways
+│       ├── ravan.db                  # SQLite findings mirror
+│       └── policies/                 # per-host active-policy files
 ├── AGENTS.md                         # auto-loaded project conventions
 ├── opencode.jsonc                    # shared perms + MCP + instructions
 ├── docs/build-prompt.md              # original build prompt (history)
@@ -45,11 +61,26 @@ them in sync (same hash).
 ## Capabilities
 
 - **Agent team, not a monolith:** orchestrator fans out to hidden
-  recon / reviewer / reporter subagents with bounded steps and
-  deny-by-default policies.
+  recon / reviewer / reporter / verifier / scout / handoff subagents
+  with bounded steps and deny-by-default policies.
 - **Passive recon first:** DNS / SPF / DKIM / DMARC / CAA / DNSSEC /
   MTA-STS, CT logs (`crt.sh` guidance), TLS chain, headers, tech
   fingerprinting, JS/CSS bundle analysis with vendor-aware FP filtering.
+- **Tiered active mode:** `active-policy.json` per target authorizes
+  Tier 0 (passive) + Tier 1 (safe active: Nuclei CVE/exposure/misconfig,
+  Semgrep SAST). Tier 2/3 require explicit per-run confirmation.
+- **No-escape mode:** proactive hunting — single authorization gate,
+  then full pipeline: passive + active + cross-reference + report +
+  stakeholder hand-off. Asks once for missing tool access.
+- **Closed-loop verification:** `@ravan-verifier` re-runs checks post-
+  remediation, diffs evidence, updates the finding ledger with
+  `verified-fixed` / `verified-present` / `indeterminate`.
+- **Cross-engagement learning:** `calibrate.py` pre-suppresses known FPs
+  and adjusts checks per target architecture. `trend.py` computes
+  posture timeline across consecutive assessments.
+- **Stakeholder hand-off:** `@ravan-handoff` generates per-stakeholder
+  artifacts — dev fix guide, exec summary, auditor evidence pack,
+  JIRA ticket bodies — from the same finding ledger.
 - **Architecture before severity:** states what the target makes
   impossible (static SPA → no SQLi/RCE/SSRF) instead of flagging noise.
 - **Modern surfaces:** OWASP 2025 delta (supply chain, exceptional
@@ -63,7 +94,7 @@ them in sync (same hash).
   per-target profile, baseline diffing (`scripts/diff.py`), `/retest`
   verification loops, OSV dependency watch (`scripts/depwatch.py`).
 - **Defensive depth:** per-stack hardening matrix, per-language
-  source→sink review playbook, IaC/container/CI-CD checklists,
+  source→sink review playbook, IaC/container/CI/CD checklists,
   detection rules + IR runbooks, email-auth sequencing
   (monitor → quarantine → reject).
 - **Reports that fund fixes:** enforced template (scope → exec summary →
@@ -106,6 +137,7 @@ you open this repo.
 
 ```text
 /assess example.com        # intake first — no scan without it
+/no-escape example.com     # proactive hunting — passive + safe active
 /threat-model example.com  # assets, STRIDE, attack trees
 /review                    # diff review via @ravan-reviewer
 /harden CSP                # staged plan with blast-radius warnings
@@ -114,16 +146,19 @@ you open this repo.
 ```
 
 Or plain language: `do a passive review of https://example.com`,
-`@ravan review my changes for IDOR`.
+`@ravan review my changes for IDOR`, `no-escape mode on example.com`.
 
 ## Verify
 
 ```bash
 python .opencode/skills/web-recon-passive/scripts/test_checks.py
 python .opencode/skills/web-recon-passive/scripts/enrich.py --selftest
+python engine/doctor.py --json
+python engine/gate.py
+python engine/policy_check.py example.com 1 --json
 ```
 
-46 offline unit tests + enrich selftest. New `checks.py` patterns require
+65 offline unit tests + enrich selftest. New `checks.py` patterns require
 new fixtures proving they do not fire on react-dom.
 
 ## License
