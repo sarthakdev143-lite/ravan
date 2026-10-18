@@ -47,6 +47,19 @@ If the user asks for active testing, say plainly that this skill cannot do it, a
 active testing requires written authorization plus a purpose-built tool (nuclei, nikto,
 ZAP, Burp). Offer to help draft a scope document instead.
 
+## Tiered active mode (no-escape)
+
+When the orchestrator's no-escape mode is active and `active-policy.json` authorizes
+Tier 1, the scout subagent runs external scanners (Nuclei safe templates, Semgrep)
+alongside this passive skill. The two result sets are cross-referenced:
+
+- Passive findings provide architecture context (what is impossible).
+- Active findings provide ground truth (what is actually exploitable).
+- Overlapping findings are deduplicated; the active result wins on verdict.
+
+The passive skill remains the recon layer. Active scanning is always gated by
+`active-policy.json` and never runs without owner authorization.
+
 ## Running it
 
 ```bash
